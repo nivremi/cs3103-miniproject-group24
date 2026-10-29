@@ -1,24 +1,11 @@
 #!/usr/bin/env python3
-"""
-CS3103 Assignment 4 - LiveRecall naive working baseline.
+"""CS3103 Assignment 4 - LiveRecall server (iteration 1, step 2).
 
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
+Entry point: python solution_server.py --port 8765
 
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
-
-Required evaluator command:
-    python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
+Updates are validated and revision-checked in liverecall_core.py before being
+forwarded in canonical form. HISTORY is still empty and live delivery is
+still the starter's naive broadcast.
 """
 
 from __future__ import annotations
@@ -26,89 +13,129 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from typing import Any
 
 import websockets
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+from liverecall_core import SessionState, encode, parse_caption_update
+
+log = logging.getLogger("liverecall")
+
+HELLO_TIMEOUT_S = 5.0
+MAX_SESSIONS = 16
+MAX_INCOMING_MESSAGE = 2**20
+
+SESSIONS: dict[str, SessionState] = {}
+CLIENTS: dict[str, set[Any]] = {}        # session -> connected client sockets
+TOTALS = {"clients_served": 0}
 
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
-
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    if not CLIENTS:
+async def broadcast_naively(session: str, text: str) -> None:
+    """Starter-kit broadcast: the source handler waits for every send."""
+    clients = CLIENTS.get(session)
+    if not clients:
         return
-
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
+    snapshot = list(clients)
+    results = await asyncio.gather(*(c.send(text) for c in snapshot),
+                                   return_exceptions=True)
     for client, result in zip(snapshot, results):
         if isinstance(result, Exception):
-            CLIENTS.discard(client)
+            clients.discard(client)
+
+
+def get_session(name: str) -> SessionState | None:
+    state = SESSIONS.get(name)
+    if state is None:
+        if len(SESSIONS) >= MAX_SESSIONS:
+            return None
+        state = SessionState(name)
+        SESSIONS[name] = state
+        log.info("session %s created", name)
+    return state
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
-    session = hello.get("session")
-    print(f"source connected: session={session}", flush=True)
-
+    default_session = hello.get("session") if isinstance(hello.get("session"), str) else "L1"
+    log.info("source connected: session=%s", default_session)
+    rejected = 0
     try:
         async for raw in ws:
             try:
                 msg = json.loads(raw)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
+                rejected += 1
+                continue
+            if not isinstance(msg, dict):
+                rejected += 1
                 continue
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                try:
+                    cap = parse_caption_update(msg, default_session)
+                except ValueError as e:
+                    rejected += 1
+                    log.debug("rejected update: %s", e)
+                    continue
+                state = get_session(cap.session)
+                if state is not None and state.apply(cap):
+                    await broadcast_naively(state.name, cap.wire)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
-                print("source finished", flush=True)
+                log.info("source finished; %s", summary_line())
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
-                continue
+                pass
+    except websockets.exceptions.ConnectionClosed:
+        pass
     finally:
-        print("source disconnected", flush=True)
+        log.info("source disconnected (rejected %d malformed messages)", rejected)
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
+    session_name = hello.get("session", "L1")
+    if not isinstance(session_name, str):
+        await ws.close(code=1008, reason="bad session")
+        return
+
+    state = get_session(session_name)
+    if state is None:
+        await ws.close(code=1013, reason="too many sessions")
+        return
+
     client_id = hello.get("client_id")
+    # No recovery state yet: HISTORY is always empty (as in the starter).
+    await ws.send(encode({"type": "HISTORY", "session": state.name, "items": []}))
+    clients = CLIENTS.setdefault(state.name, set())
+    clients.add(ws)
+    TOTALS["clients_served"] += 1
+    log.debug("client %s connected; clients=%d", client_id, len(clients))
 
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
     try:
         # Student clients normally don't send further messages after hello.
         # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
             pass
+    except websockets.exceptions.ConnectionClosed:
+        pass
     finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        clients.discard(ws)
+        log.debug("client %s disconnected; clients=%d", client_id, len(clients))
 
 
 async def handler(ws) -> None:
     try:
-        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+        raw = await asyncio.wait_for(ws.recv(), timeout=HELLO_TIMEOUT_S)
         hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+        if not isinstance(hello, dict):
+            raise ValueError
+    except (asyncio.TimeoutError, json.JSONDecodeError, TypeError, ValueError):
         await ws.close(code=1008, reason="Expected a valid hello message")
+        return
+    except websockets.exceptions.ConnectionClosed:
         return
 
     msg_type = hello.get("type")
@@ -120,25 +147,54 @@ async def handler(ws) -> None:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
 
-async def main_async(port: int) -> None:
+def summary_line() -> str:
+    nclients = sum(len(c) for c in CLIENTS.values())
+    counters = {}
+    for s in SESSIONS.values():
+        for k, v in s.counters.items():
+            counters[k] = counters.get(k, 0) + v
+    return f"clients={nclients} source={counters}"
+
+
+async def stats_loop(interval: float) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        log.info("stats %s", summary_line())
+
+
+async def main_async(args) -> None:
     async with websockets.serve(
         handler,
-        "0.0.0.0",
-        port,
-        max_size=2**20,
+        args.host,
+        args.port,
+        max_size=MAX_INCOMING_MESSAGE,
         ping_interval=20,
-        ping_timeout=20,
+        ping_timeout=40,
     ):
-        print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+        log.info("LiveRecall listening on ws://%s:%d", args.host, args.port)
+        if args.stats_interval > 0:
+            asyncio.create_task(stats_loop(args.stats_interval))
         await asyncio.Future()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8765)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="LiveRecall caption server")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--verbose", action="store_true", help="log every client connect/disconnect")
+    p.add_argument("--stats-interval", type=float, default=0,
+                   help="print delivery statistics every N seconds (0 = off)")
+    args = p.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    # The websockets library is chatty at DEBUG; keep our own logs readable.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
     try:
-        asyncio.run(main_async(args.port))
+        asyncio.run(main_async(args))
     except KeyboardInterrupt:
         pass
 

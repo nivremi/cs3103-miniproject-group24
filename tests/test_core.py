@@ -143,13 +143,93 @@ class SessionStateTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# §3 rows 9-11, §4.3 per-client delivery
+# ---------------------------------------------------------------------------
+
+async def run_source(state, segments, revisions=3, rev_delay=0.0, gap=0.0, start=1):
+    """Feed a state like caption_source.py does, broadcasting accepted updates."""
+    for seg in range(start, start + segments):
+        for rev in range(1, revisions + 1):
+            c = cap(seg, rev, final=(rev == revisions))
+            if state.apply(c):
+                state.broadcast(c)
+            if rev != revisions and rev_delay:
+                await asyncio.sleep(rev_delay)
+        if gap:
+            await asyncio.sleep(gap)
+
+
+def check_client_invariants(test, ws):
+    """No stale/duplicate revision and every final at most once."""
+    highest = {}
+    for m in ws.messages("CAPTION_UPDATE"):
+        seg, rev = m["segment"], m["revision"]
+        test.assertGreater(rev, highest.get(seg, 0), f"stale/duplicate {seg}/{rev}")
+        highest[seg] = rev
+
+
+class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def _client(self, state, ws, cfg, last_segment=0):
+        conn = core.ClientConn(ws, state, 1, last_segment, cfg)
+        state.clients.add(conn)
+        conn.start()
+        return conn
+
+    async def test_fast_client_gets_every_revision_even_in_bursts(self):
+        cfg = core.ServerConfig()
+        state = core.SessionState("L1", cfg)
+        ws = FakeClientWS()
+        conn = await self._client(state, ws, cfg)
+        await run_source(state, 30)               # 90 updates in one burst
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(ws.messages()), 90)
+        check_client_invariants(self, ws)
+        conn.stop()
+
+    async def test_without_window_backlog_grows(self):
+        """Ablation: window off = every revision goes straight into the
+        transport, so the slow reader falls further and further behind."""
+        cfg = core.ServerConfig(window=0)
+        state = core.SessionState("L1", cfg)
+        slow = FakeClientWS(period=0.05)
+        conn = await self._client(state, slow, cfg)
+        await run_source(state, 60, rev_delay=0.02, gap=0.035)
+        backlog = slow.sent_count - len(slow.received)
+        self.assertGreater(backlog, 50)
+        conn.stop()
+        slow._consumer.cancel()
+
+    async def test_overflow_closes_with_1013(self):
+        cfg = core.ServerConfig(max_pending=20)
+        state = core.SessionState("L1", cfg)
+        stuck = FakeClientWS(period=3600)         # never drains
+        conn = await self._client(state, stuck, cfg)
+        await run_source(state, 40)
+        await asyncio.sleep(0.01)
+        self.assertTrue(conn.overflowed)
+        self.assertEqual(stuck.close_code, core.CLOSE_TOO_SLOW)
+        self.assertEqual(conn.npending, 0)        # memory released
+        if stuck._consumer:
+            stuck._consumer.cancel()
+
+    async def test_floor_skips_finals_client_already_has(self):
+        cfg = core.ServerConfig()
+        state = core.SessionState("L1", cfg)
+        ws = FakeClientWS()
+        conn = await self._client(state, ws, cfg, last_segment=5)
+        await run_source(state, 7)
+        await asyncio.sleep(0.02)
+        self.assertEqual({m["segment"] for m in ws.messages()}, {6, 7})
+        conn.stop()
+
+
+# ---------------------------------------------------------------------------
 # Handler-level flow (§4.2): HISTORY first, resume, no duplicate finals
 # ---------------------------------------------------------------------------
 
 class HandlerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         server.SESSIONS.clear()
-        server.CLIENTS.clear()
 
     async def _source(self):
         src = FakeClientWS()

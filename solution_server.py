@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""CS3103 Assignment 4 - LiveRecall server (iteration 1, step 3).
+"""CS3103 Assignment 4 - LiveRecall server (iteration 1).
 
 Entry point: python solution_server.py --port 8765
 
-WebSocket glue; caption state and history live in liverecall_core.py so they
-can be unit-tested without a network. Live delivery is still the starter's
-naive broadcast (the source waits for every client's send).
+WebSocket glue; graded logic is in liverecall_core.py so it can be
+unit-tested without a network. Experiment flags (--window 0 etc.) are for
+the before/after comparison; defaults are the submitted config.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import websockets
 
 from liverecall_core import (
     DEFAULT_HISTORY_SECONDS,
+    ClientConn,
     ServerConfig,
     SessionState,
     history_message,
@@ -34,21 +35,8 @@ MAX_INCOMING_MESSAGE = 2**20
 
 CONFIG = ServerConfig()
 SESSIONS: dict[str, SessionState] = {}
-CLIENTS: dict[str, set[Any]] = {}        # session -> connected client sockets
-TOTALS = {"clients_served": 0}
-
-
-async def broadcast_naively(session: str, text: str) -> None:
-    """Starter-kit broadcast: the source handler waits for every send."""
-    clients = CLIENTS.get(session)
-    if not clients:
-        return
-    snapshot = list(clients)
-    results = await asyncio.gather(*(c.send(text) for c in snapshot),
-                                   return_exceptions=True)
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            clients.discard(client)
+TOTALS = {"clients_served": 0, "overflow_closes": 0,
+          "gate_events": 0, "max_pending_seen": 0}
 
 
 def get_session(name: str) -> SessionState | None:
@@ -94,7 +82,7 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                     continue
                 state = get_session(cap.session)
                 if state is not None and state.apply(cap):
-                    await broadcast_naively(state.name, cap.wire)
+                    state.broadcast(cap)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
@@ -129,15 +117,18 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         return
 
     client_id = hello.get("client_id")
+    conn = ClientConn(ws, state, client_id, last_segment, CONFIG)
+
+    # No await between building HISTORY and registering for live updates:
+    # asyncio can't run the source handler in between, so no final can fall
+    # into the gap or be delivered twice.
     items, gap = state.recovery_items(last_segment, last_revision, float(history_seconds))
-    # KNOWN ISSUE: the source handler can run during this await. A final
-    # accepted then is in neither this HISTORY nor this client's live stream.
-    await ws.send(history_message(state.name, items, gap))
-    clients = CLIENTS.setdefault(state.name, set())
-    clients.add(ws)
+    conn.send_control(history_message(state.name, items, gap))
+    state.clients.add(conn)
+    conn.start()
     TOTALS["clients_served"] += 1
     log.debug("client %s connected (resume=%d, history=%d items, gap=%s); clients=%d",
-              client_id, last_segment, len(items), gap, len(clients))
+              client_id, last_segment, len(items), gap, len(state.clients))
 
     try:
         # Student clients normally don't send further messages after hello.
@@ -147,8 +138,13 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        clients.discard(ws)
-        log.debug("client %s disconnected; clients=%d", client_id, len(clients))
+        state.clients.discard(conn)
+        conn.stop()
+        TOTALS["gate_events"] += conn.gate_events
+        TOTALS["max_pending_seen"] = max(TOTALS["max_pending_seen"], conn.max_npending)
+        if conn.overflowed:
+            TOTALS["overflow_closes"] += 1
+        log.debug("client %s disconnected; clients=%d", client_id, len(state.clients))
 
 
 async def handler(ws) -> None:
@@ -173,13 +169,18 @@ async def handler(ws) -> None:
 
 
 def summary_line() -> str:
-    nclients = sum(len(c) for c in CLIENTS.values())
+    live = [c for s in SESSIONS.values() for c in s.clients]
+    max_pending = max([TOTALS["max_pending_seen"]] + [c.max_npending for c in live])
+    gated_now = sum(c.gated for c in live)
     hist = sum(len(s.history) for s in SESSIONS.values())
     counters = {}
     for s in SESSIONS.values():
         for k, v in s.counters.items():
             counters[k] = counters.get(k, 0) + v
-    return f"clients={nclients} history_items={hist} source={counters}"
+    return (f"clients={len(live)} gated_now={gated_now} history_items={hist} "
+            f"max_pending={max_pending} "
+            f"overflow_closes={TOTALS['overflow_closes']} "
+            f"source={counters}")
 
 
 async def stats_loop(interval: float) -> None:
@@ -197,8 +198,10 @@ async def main_async(args) -> None:
         ping_interval=20,
         ping_timeout=40,
     ):
-        log.info("LiveRecall listening on ws://%s:%d (history=%.0fs)",
-                 args.host, args.port, CONFIG.history_retain_s)
+        log.info("LiveRecall listening on ws://%s:%d (window=%d, "
+                 "max_pending=%d, history=%.0fs)", args.host, args.port,
+                 CONFIG.window, CONFIG.max_pending,
+                 CONFIG.history_retain_s)
         if args.stats_interval > 0:
             asyncio.create_task(stats_loop(args.stats_interval))
         await asyncio.Future()
@@ -212,6 +215,10 @@ def main() -> None:
     p.add_argument("--stats-interval", type=float, default=0,
                    help="print delivery statistics every N seconds (0 = off)")
     exp = p.add_argument_group("experiment switches (defaults = submitted design)")
+    exp.add_argument("--window", type=int, default=CONFIG.window,
+                     help="max unacknowledged messages per client; 0 disables the send window")
+    exp.add_argument("--ping-after", type=int, default=CONFIG.ping_after)
+    exp.add_argument("--max-pending", type=int, default=CONFIG.max_pending)
     exp.add_argument("--history-retain", type=float, default=CONFIG.history_retain_s,
                      help="seconds of finalized captions kept for recovery (>= 60)")
     exp.add_argument("--history-max-items", type=int, default=CONFIG.history_max_items)
@@ -219,7 +226,12 @@ def main() -> None:
 
     if args.history_retain < 60:
         p.error("--history-retain must be >= 60 (§3 row 8)")
+    if args.window and args.ping_after >= args.window:
+        p.error("--ping-after must be smaller than --window")
 
+    CONFIG.window = max(0, args.window)
+    CONFIG.ping_after = max(1, args.ping_after)
+    CONFIG.max_pending = max(1, args.max_pending)
     CONFIG.history_retain_s = args.history_retain
     CONFIG.history_max_items = max(1, args.history_max_items)
 

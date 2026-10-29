@@ -183,13 +183,39 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         await run_source(state, 30)               # 90 updates in one burst
         await asyncio.sleep(0.05)
         self.assertEqual(len(ws.messages()), 90)
+        self.assertEqual(conn.coalesced, 0)
         check_client_invariants(self, ws)
         conn.stop()
 
+    async def test_slow_reader_coalesced_bounded_and_complete(self):
+        # Time-scaled public T3: source 3 revs per 0.075 s, reader 0.05 s/msg
+        # (same ratios as 0.2 s / 0.35 s gap / 500 ms slow reader).
+        cfg = core.ServerConfig(coalesce_age_s=0.015)
+        state = core.SessionState("L1", cfg)
+        slow = FakeClientWS(period=0.05)
+        fast = FakeClientWS()
+        c_slow = await self._client(state, slow, cfg)
+        c_fast = await self._client(state, fast, cfg)
+        segments = 60
+        await run_source(state, segments, rev_delay=0.02, gap=0.035)
+        await asyncio.sleep(1.5)                  # let the slow reader drain
+
+        finals_slow = {m["segment"] for m in slow.messages() if m["final"]}
+        self.assertEqual(finals_slow, set(range(1, segments + 1)))  # complete
+        self.assertEqual(len(fast.messages()), segments * 3)        # unaffected
+        self.assertGreater(c_slow.coalesced, 0)
+        self.assertLessEqual(c_slow.max_npending, 10)               # bounded
+        check_client_invariants(self, slow)
+        # In-flight data is bounded by the window, so the slow client is at
+        # most ~window messages behind, not the whole backlog.
+        self.assertLessEqual(slow.sent_count - len(slow.received), cfg.window)
+        c_slow.stop()
+        c_fast.stop()
+
     async def test_without_window_backlog_grows(self):
-        """Ablation: window off = every revision goes straight into the
-        transport, so the slow reader falls further and further behind."""
-        cfg = core.ServerConfig(window=0)
+        """Ablation: window off + no coalescing = every revision goes into
+        the transport, so the slow reader falls further and further behind."""
+        cfg = core.ServerConfig(window=0, coalesce=False)
         state = core.SessionState("L1", cfg)
         slow = FakeClientWS(period=0.05)
         conn = await self._client(state, slow, cfg)

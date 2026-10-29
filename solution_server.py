@@ -4,7 +4,7 @@
 Entry point: python solution_server.py --port 8765
 
 WebSocket glue; graded logic is in liverecall_core.py so it can be
-unit-tested without a network. Experiment flags (--window 0 etc.) are for
+unit-tested without a network. Experiment flags (--no-coalesce etc.) are for
 the before/after comparison; defaults are the submitted config.
 """
 
@@ -35,7 +35,7 @@ MAX_INCOMING_MESSAGE = 2**20
 
 CONFIG = ServerConfig()
 SESSIONS: dict[str, SessionState] = {}
-TOTALS = {"clients_served": 0, "overflow_closes": 0,
+TOTALS = {"clients_served": 0, "coalesced": 0, "overflow_closes": 0,
           "gate_events": 0, "max_pending_seen": 0}
 
 
@@ -140,6 +140,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
     finally:
         state.clients.discard(conn)
         conn.stop()
+        TOTALS["coalesced"] += conn.coalesced
         TOTALS["gate_events"] += conn.gate_events
         TOTALS["max_pending_seen"] = max(TOTALS["max_pending_seen"], conn.max_npending)
         if conn.overflowed:
@@ -170,6 +171,7 @@ async def handler(ws) -> None:
 
 def summary_line() -> str:
     live = [c for s in SESSIONS.values() for c in s.clients]
+    coalesced = TOTALS["coalesced"] + sum(c.coalesced for c in live)
     max_pending = max([TOTALS["max_pending_seen"]] + [c.max_npending for c in live])
     gated_now = sum(c.gated for c in live)
     hist = sum(len(s.history) for s in SESSIONS.values())
@@ -178,7 +180,7 @@ def summary_line() -> str:
         for k, v in s.counters.items():
             counters[k] = counters.get(k, 0) + v
     return (f"clients={len(live)} gated_now={gated_now} history_items={hist} "
-            f"max_pending={max_pending} "
+            f"coalesced={coalesced} max_pending={max_pending} "
             f"overflow_closes={TOTALS['overflow_closes']} "
             f"source={counters}")
 
@@ -198,9 +200,9 @@ async def main_async(args) -> None:
         ping_interval=20,
         ping_timeout=40,
     ):
-        log.info("LiveRecall listening on ws://%s:%d (window=%d, "
+        log.info("LiveRecall listening on ws://%s:%d (window=%d, coalesce=%s, "
                  "max_pending=%d, history=%.0fs)", args.host, args.port,
-                 CONFIG.window, CONFIG.max_pending,
+                 CONFIG.window, CONFIG.coalesce, CONFIG.max_pending,
                  CONFIG.history_retain_s)
         if args.stats_interval > 0:
             asyncio.create_task(stats_loop(args.stats_interval))
@@ -219,6 +221,9 @@ def main() -> None:
                      help="max unacknowledged messages per client; 0 disables the send window")
     exp.add_argument("--ping-after", type=int, default=CONFIG.ping_after)
     exp.add_argument("--max-pending", type=int, default=CONFIG.max_pending)
+    exp.add_argument("--no-coalesce", action="store_true",
+                     help="never drop superseded provisional revisions")
+    exp.add_argument("--coalesce-age-ms", type=float, default=CONFIG.coalesce_age_s * 1000)
     exp.add_argument("--history-retain", type=float, default=CONFIG.history_retain_s,
                      help="seconds of finalized captions kept for recovery (>= 60)")
     exp.add_argument("--history-max-items", type=int, default=CONFIG.history_max_items)
@@ -232,6 +237,8 @@ def main() -> None:
     CONFIG.window = max(0, args.window)
     CONFIG.ping_after = max(1, args.ping_after)
     CONFIG.max_pending = max(1, args.max_pending)
+    CONFIG.coalesce = not args.no_coalesce
+    CONFIG.coalesce_age_s = max(0.0, args.coalesce_age_ms / 1000.0)
     CONFIG.history_retain_s = args.history_retain
     CONFIG.history_max_items = max(1, args.history_max_items)
 

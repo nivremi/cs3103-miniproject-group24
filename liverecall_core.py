@@ -37,6 +37,7 @@ MAX_SESSION_CHARS = 64
 DEFAULT_WINDOW = 8          # max messages sent but not yet ping-acknowledged
 DEFAULT_PING_AFTER = 4      # send a marker ping once this many are unacked
 DEFAULT_MAX_PENDING = 400   # hard bound on queued items per client
+DEFAULT_COALESCE_AGE_S = 0.15  # a pending item this old means "client is behind"
 
 # WebSocket close code 1013 = "try again later": client reconnects and
 # resumes with its last finalized state (§4.2).
@@ -50,6 +51,8 @@ class ServerConfig:
     window: int = DEFAULT_WINDOW            # 0 disables ping-window gating
     ping_after: int = DEFAULT_PING_AFTER
     max_pending: int = DEFAULT_MAX_PENDING
+    coalesce: bool = True                   # False = keep every revision (ablation)
+    coalesce_age_s: float = DEFAULT_COALESCE_AGE_S
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,10 +234,11 @@ class ClientConn:
     1. Send window: at most ``window`` messages unacknowledged. Marker pings
        track acknowledgement -- the client library processes frames in order,
        so a pong means everything before that ping was consumed.
-    2. Pending buffer keyed by segment, oldest segment first. Every
-       revision is kept for now (no dropping yet).
-    3. Hard bound: if the buffer exceeds max_pending, close with 1013; the
-       client resumes via HISTORY.
+    2. Pending buffer keyed by segment. A provisional is replaced by a newer
+       revision when the window is full or it has waited >= coalesce_age_s.
+       A burst to a healthy client is not coalesced.
+    3. Hard bound: if the buffer exceeds max_pending after compaction, close
+       with 1013; the client resumes via HISTORY.
     """
 
     def __init__(self, ws: Any, session: SessionState, client_id: Any,
@@ -259,6 +263,7 @@ class ClientConn:
         self._sender: asyncio.Task | None = None
 
         # statistics for logs/report
+        self.coalesced = 0
         self.max_npending = 0
         self.gated = False
         self.gate_events = 0
@@ -299,20 +304,39 @@ class ClientConn:
             last = slots[-1]
             if cap.revision <= last[0].revision:
                 return
-            slots.append([cap, now])
-            self.npending += 1
+            if (self.cfg.coalesce and not last[0].final
+                    and (self._window_full()
+                         or now - last[1] >= self.cfg.coalesce_age_s)):
+                last[0] = cap            # replace in place; keep queue position
+                self.coalesced += 1
+            else:
+                slots.append([cap, now])
+                self.npending += 1
 
         if self.npending > self.max_npending:
             self.max_npending = self.npending
         if self.npending > self.cfg.max_pending:
-            self._overflow()
-            return
+            self._compact()
+            if self.npending > self.cfg.max_pending:
+                self._overflow()
+                return
         self.wake.set()
 
     # -- overload helpers --------------------------------------------------
 
     def _window_full(self) -> bool:
         return self.cfg.window > 0 and self.sent - self.acked >= self.cfg.window
+
+    def _compact(self) -> None:
+        """Keep only finals and the newest revision of each segment."""
+        if not self.cfg.coalesce:
+            return
+        for seg, slots in self.pending.items():
+            if len(slots) > 1:
+                removed = len(slots) - 1
+                self.pending[seg] = [slots[-1]]
+                self.npending -= removed
+                self.coalesced += removed
 
     def _overflow(self) -> None:
         log.warning("client %s too slow (%d pending); closing with %d to force resume",
@@ -333,14 +357,21 @@ class ClientConn:
         """Next message to send, None if nothing is sendable right now."""
         if self.control:
             return self.control.popleft()
-        if not self.pending:
-            return None
-        seg, slots = next(iter(self.pending.items()))
-        cap, _ = slots.pop(0)
-        self.npending -= 1
-        if not slots:
-            del self.pending[seg]
-        return cap.wire
+        now = time.monotonic()
+        while self.pending:
+            seg, slots = next(iter(self.pending.items()))
+            cap, enq = slots.pop(0)
+            self.npending -= 1
+            if not slots:
+                del self.pending[seg]
+            # Dequeue-time coalescing: a provisional that has a newer
+            # revision queued behind it and has waited too long is obsolete.
+            if (self.cfg.coalesce and slots and not cap.final
+                    and now - enq >= self.cfg.coalesce_age_s):
+                self.coalesced += 1
+                continue
+            return cap.wire
+        return None
 
     async def _run(self) -> None:
         try:

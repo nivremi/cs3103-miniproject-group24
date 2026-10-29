@@ -1,0 +1,10 @@
+TCP provides reliable byte stream delivery between application processes.
+The receiver acknowledges data so that the sender can detect missing information.
+Round trip time measurements are used to estimate a retransmission timeout.
+HTTP version three uses QUIC over UDP rather than TCP.
+A router decrements the IPv4 time to live field before forwarding a packet.
+Network address translation changes addressing information at a network boundary.
+Packet loss may increase application delay when retransmission is required.
+A good network experiment should report both average and tail latency.
+Live captions may be revised several times before the final text is available.
+A reconnecting LiveRecall client should recover only the recent context that it missed.

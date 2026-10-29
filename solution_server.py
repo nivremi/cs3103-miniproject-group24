@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""CS3103 Assignment 4 - LiveRecall server (iteration 1, step 2).
+"""CS3103 Assignment 4 - LiveRecall server (iteration 1, step 3).
 
 Entry point: python solution_server.py --port 8765
 
-Updates are validated and revision-checked in liverecall_core.py before being
-forwarded in canonical form. HISTORY is still empty and live delivery is
-still the starter's naive broadcast.
+WebSocket glue; caption state and history live in liverecall_core.py so they
+can be unit-tested without a network. Live delivery is still the starter's
+naive broadcast (the source waits for every client's send).
 """
 
 from __future__ import annotations
@@ -18,7 +18,13 @@ from typing import Any
 
 import websockets
 
-from liverecall_core import SessionState, encode, parse_caption_update
+from liverecall_core import (
+    DEFAULT_HISTORY_SECONDS,
+    ServerConfig,
+    SessionState,
+    history_message,
+    parse_caption_update,
+)
 
 log = logging.getLogger("liverecall")
 
@@ -26,6 +32,7 @@ HELLO_TIMEOUT_S = 5.0
 MAX_SESSIONS = 16
 MAX_INCOMING_MESSAGE = 2**20
 
+CONFIG = ServerConfig()
 SESSIONS: dict[str, SessionState] = {}
 CLIENTS: dict[str, set[Any]] = {}        # session -> connected client sockets
 TOTALS = {"clients_served": 0}
@@ -49,10 +56,17 @@ def get_session(name: str) -> SessionState | None:
     if state is None:
         if len(SESSIONS) >= MAX_SESSIONS:
             return None
-        state = SessionState(name)
+        state = SessionState(name, CONFIG)
         SESSIONS[name] = state
         log.info("session %s created", name)
     return state
+
+
+def _int_field(msg: dict, name: str, default: int = 0) -> int:
+    v = msg.get(name, default)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ValueError(f"bad {name}")
+    return v
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
@@ -96,9 +110,17 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
 
 async def handle_client(ws, hello: dict[str, Any]) -> None:
-    session_name = hello.get("session", "L1")
-    if not isinstance(session_name, str):
-        await ws.close(code=1008, reason="bad session")
+    try:
+        session_name = hello.get("session", "L1")
+        if not isinstance(session_name, str):
+            raise ValueError("bad session")
+        last_segment = _int_field(hello, "last_segment")
+        last_revision = _int_field(hello, "last_revision")
+        history_seconds = hello.get("history_seconds", DEFAULT_HISTORY_SECONDS)
+        if isinstance(history_seconds, bool) or not isinstance(history_seconds, (int, float)):
+            raise ValueError("bad history_seconds")
+    except ValueError as e:
+        await ws.close(code=1008, reason=str(e))
         return
 
     state = get_session(session_name)
@@ -107,12 +129,15 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         return
 
     client_id = hello.get("client_id")
-    # No recovery state yet: HISTORY is always empty (as in the starter).
-    await ws.send(encode({"type": "HISTORY", "session": state.name, "items": []}))
+    items, gap = state.recovery_items(last_segment, last_revision, float(history_seconds))
+    # KNOWN ISSUE: the source handler can run during this await. A final
+    # accepted then is in neither this HISTORY nor this client's live stream.
+    await ws.send(history_message(state.name, items, gap))
     clients = CLIENTS.setdefault(state.name, set())
     clients.add(ws)
     TOTALS["clients_served"] += 1
-    log.debug("client %s connected; clients=%d", client_id, len(clients))
+    log.debug("client %s connected (resume=%d, history=%d items, gap=%s); clients=%d",
+              client_id, last_segment, len(items), gap, len(clients))
 
     try:
         # Student clients normally don't send further messages after hello.
@@ -149,11 +174,12 @@ async def handler(ws) -> None:
 
 def summary_line() -> str:
     nclients = sum(len(c) for c in CLIENTS.values())
+    hist = sum(len(s.history) for s in SESSIONS.values())
     counters = {}
     for s in SESSIONS.values():
         for k, v in s.counters.items():
             counters[k] = counters.get(k, 0) + v
-    return f"clients={nclients} source={counters}"
+    return f"clients={nclients} history_items={hist} source={counters}"
 
 
 async def stats_loop(interval: float) -> None:
@@ -171,7 +197,8 @@ async def main_async(args) -> None:
         ping_interval=20,
         ping_timeout=40,
     ):
-        log.info("LiveRecall listening on ws://%s:%d", args.host, args.port)
+        log.info("LiveRecall listening on ws://%s:%d (history=%.0fs)",
+                 args.host, args.port, CONFIG.history_retain_s)
         if args.stats_interval > 0:
             asyncio.create_task(stats_loop(args.stats_interval))
         await asyncio.Future()
@@ -184,7 +211,17 @@ def main() -> None:
     p.add_argument("--verbose", action="store_true", help="log every client connect/disconnect")
     p.add_argument("--stats-interval", type=float, default=0,
                    help="print delivery statistics every N seconds (0 = off)")
+    exp = p.add_argument_group("experiment switches (defaults = submitted design)")
+    exp.add_argument("--history-retain", type=float, default=CONFIG.history_retain_s,
+                     help="seconds of finalized captions kept for recovery (>= 60)")
+    exp.add_argument("--history-max-items", type=int, default=CONFIG.history_max_items)
     args = p.parse_args()
+
+    if args.history_retain < 60:
+        p.error("--history-retain must be >= 60 (§3 row 8)")
+
+    CONFIG.history_retain_s = args.history_retain
+    CONFIG.history_max_items = max(1, args.history_max_items)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

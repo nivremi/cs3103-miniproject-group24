@@ -1,7 +1,9 @@
 """Fake WebSocket connections for unit tests (no network, no websockets package).
 
-FakeClientWS consumes one message every period seconds. A ping is answered
-once every message sent before it has been consumed.
+FakeClientWS consumes one message every period seconds. buffered>0 models the
+websockets receive queue (max_queue=16): pings are answered immediately until
+the queue fills, then held until it drains to buffered//4. This reproduces the
+T3 scenario where a slow reader's backlog hides inside the client library.
 """
 
 from __future__ import annotations
@@ -14,8 +16,11 @@ import types
 
 
 class FakeClientWS:
-    def __init__(self, period: float = 0.0):
+    def __init__(self, period: float = 0.0, buffered: int = 0):
         self.period = period          # seconds per consumed message; 0 = instant
+        self.buffered = buffered      # unread messages the client library absorbs
+        self._read_upto = 0           # messages the client library has read
+        self._paused = False
         self.inbox: list[tuple[str, float]] = []   # (text, send_time)
         self.received: list[tuple[dict, float]] = []  # (msg, consume_time)
         self.sent_count = 0
@@ -78,9 +83,18 @@ class FakeClientWS:
 
     def _resolve_pings(self) -> None:
         consumed = len(self.received)
+        if self.buffered:
+            if self._paused and self._read_upto - consumed <= self.buffered // 4:
+                self._paused = False
+            if not self._paused:
+                self._read_upto = self.sent_count
+                self._paused = self._read_upto - consumed > self.buffered
+            readable = self._read_upto       # a ping is answered once read
+        else:
+            readable = consumed              # no client queue: answered in order
         still = []
         for marker, fut in self._pings:
-            if consumed >= marker and not fut.done():
+            if readable >= marker and not fut.done():
                 fut.set_result(0.0)
             elif not fut.done():
                 still.append((marker, fut))

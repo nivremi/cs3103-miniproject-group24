@@ -225,6 +225,107 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         conn.stop()
         slow._consumer.cancel()
 
+    # Time-scaled T3 again (x1/10), but the reader has a 16-message library
+    # queue in front of it, like the real load client. Thresholds are scaled
+    # the same way: 1 s RTT -> 0.1 s, 10 s hold -> 1 s, 1 s idle -> 0.1 s,
+    # 3 s slow-reader RTT -> 0.3 s, 120 s max hold -> 12 s.
+    SCALED_DEGRADE = dict(coalesce_age_s=0.015, degrade_rtt_s=0.1,
+                          degrade_hold_s=1.0, degraded_idle_s=0.1,
+                          slow_reader_rtt_s=0.3, degrade_hold_max_s=12.0)
+
+    async def _hidden_backlog_run(self, degrade: bool):
+        cfg = core.ServerConfig(degrade=degrade, **self.SCALED_DEGRADE)
+        state = core.SessionState("L1", cfg)
+        slow = FakeClientWS(period=0.05, buffered=16)
+        fast = FakeClientWS(buffered=16)
+        c_slow = await self._client(state, slow, cfg)
+        c_fast = await self._client(state, fast, cfg)
+        segments = 80
+        samples = []
+
+        async def sample():
+            while True:
+                samples.append(slow.unread() + c_slow.npending)
+                await asyncio.sleep(0.05)
+
+        sampler = asyncio.create_task(sample())
+        await run_source(state, segments, rev_delay=0.02, gap=0.035)
+        sampler.cancel()
+        # Smallest backlog in the second half of the run: did it converge?
+        best_late_backlog = min(samples[len(samples) // 2:])
+        await asyncio.sleep(2.0)                  # let the slow reader drain
+        c_slow.stop()
+        c_fast.stop()
+        return slow, fast, c_slow, c_fast, segments, best_late_backlog
+
+    async def test_hidden_backlog_without_degraded_mode(self):
+        """Iteration-1 behaviour: the backlog sits in the client library."""
+        slow, _, c_slow, _, _, backlog = await self._hidden_backlog_run(degrade=False)
+        self.assertEqual(c_slow.degrade_events, 0)
+        self.assertGreaterEqual(backlog, 12)      # never below ~6 s unscaled
+
+    async def test_degraded_mode_drains_hidden_backlog(self):
+        slow, fast, c_slow, c_fast, segments, backlog = \
+            await self._hidden_backlog_run(degrade=True)
+        self.assertGreaterEqual(c_slow.degrade_events, 1)
+        self.assertLessEqual(backlog, 2)          # caught up
+        finals_slow = {m["segment"] for m in slow.messages() if m["final"]}
+        self.assertEqual(finals_slow, set(range(1, segments + 1)))  # complete
+        check_client_invariants(self, slow)
+        # The fast client is never degraded and gets every revision.
+        self.assertEqual(c_fast.degrade_events, 0)
+        self.assertEqual(len(fast.messages()), segments * 3)
+
+    async def test_degraded_client_gets_newest_provisional_when_idle(self):
+        """§4.3: even degraded, the newest revision of the active segment is
+        delivered once the client has caught up, and the mode is left after
+        the hold time."""
+        cfg = core.ServerConfig(**self.SCALED_DEGRADE)
+        state = core.SessionState("L1", cfg)
+        ws = FakeClientWS()
+        conn = await self._client(state, ws, cfg)
+        conn._note_slow(time.monotonic(), rtt=0.1)   # as if a ping had been slow
+        self.assertTrue(conn.degraded)
+        for rev in (1, 2, 3):                     # segment 1 still open
+            c = cap(1, rev)
+            state.apply(c)
+            state.broadcast(c)
+        await asyncio.sleep(0.4)
+        self.assertEqual(keys(ws.messages()), [(1, 3)])   # only the newest
+        await asyncio.sleep(1.0)                  # hold (1 s) expires
+        c = cap(1, 4)
+        state.apply(c)
+        state.broadcast(c)
+        await asyncio.sleep(0.05)
+        self.assertFalse(conn.degraded)
+        self.assertEqual(keys(ws.messages())[-1], (1, 4))
+        conn.stop()
+
+    async def test_degraded_hold_scales_with_rtt_and_backs_off(self):
+        cfg = core.ServerConfig(degrade_hold_s=1.0, degrade_hold_max_s=3.0)
+        state = core.SessionState("L1", cfg)
+        conn = core.ClientConn(FakeClientWS(), state, 1, 0, cfg)
+        t = 100.0
+        f = core.DRAIN_FACTOR
+        conn._note_slow(t, rtt=1.0)               # 1 s behind -> stay f x 1 s
+        self.assertEqual(conn.degraded_until, t + f)
+        conn._update_mode(t + f - 0.1)
+        self.assertTrue(conn.degraded)
+        conn._update_mode(t + f)                  # episode lasted f seconds
+        self.assertFalse(conn.degraded)
+        conn._note_slow(t + f + 1.0, rtt=0.1)     # relapse within f seconds
+        self.assertEqual(conn.hold_s, 2.0)
+        conn._update_mode(t + f + 3.0)            # episode lasted 2 s
+        conn._note_slow(t + f + 4.0, rtt=0.1)     # relapse again
+        self.assertEqual(conn.hold_s, 3.0)        # capped
+        conn._update_mode(t + f + 7.0)
+        conn._note_slow(t + f + 40.0, rtt=0.1)    # long healthy period: reset
+        self.assertEqual(conn.hold_s, 1.0)
+        conn._update_mode(t + f + 50.0)
+        self.assertFalse(conn.degraded)
+        conn._note_slow(t + 200.0, rtt=cfg.slow_reader_rtt_s)   # queue overflowed
+        self.assertEqual(conn.degraded_until, t + 200.0 + cfg.degrade_hold_max_s)
+
     async def test_overflow_closes_with_1013(self):
         cfg = core.ServerConfig(max_pending=20)
         state = core.SessionState("L1", cfg)

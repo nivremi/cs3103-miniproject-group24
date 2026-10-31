@@ -1,4 +1,4 @@
-"""LiveRecall server core (iteration 1).
+"""LiveRecall server core (iteration 2).
 
 Network-free; unit-tested via tests/test_core.py.
 § references are to the CS3103 A4 brief.
@@ -39,6 +39,18 @@ DEFAULT_PING_AFTER = 4      # send a marker ping once this many are unacked
 DEFAULT_MAX_PENDING = 400   # hard bound on queued items per client
 DEFAULT_COALESCE_AGE_S = 0.15  # a pending item this old means "client is behind"
 
+# Finals-only degraded mode (iteration 2). See ClientConn for the reasoning.
+DEFAULT_DEGRADE_RTT_S = 1.0        # ping RTT (or outstanding ping age) = "slow"
+DEFAULT_DEGRADE_HOLD_S = 10.0      # first hold time after the last slow signal
+DEFAULT_DEGRADE_HOLD_MAX_S = 120.0  # cap for the exponential hold back-off
+DEFAULT_SLOW_READER_RTT_S = 3.0    # ping this slow = the client's own queue overflowed
+DEFAULT_DEGRADED_IDLE_S = 1.0      # degraded: provisional only after this idle time
+DEFAULT_DEGRADE_HEADROOM = 0.8     # leave only if full rate <= 80% of read rate
+DRAIN_FACTOR = 6.0                 # hold >= 6 x slow RTT (time to drain the backlog)
+RATE_PERIOD_S = 2.0                # offered-rate measurement period
+READ_RATE_WINDOW_S = 10.0          # read-rate measurement period
+SATURATED_FRACTION = 0.8           # ...counted only if blocked on the window this often
+
 # WebSocket close code 1013 = "try again later": client reconnects and
 # resumes with its last finalized state (§4.2).
 CLOSE_TOO_SLOW = 1013
@@ -53,6 +65,12 @@ class ServerConfig:
     max_pending: int = DEFAULT_MAX_PENDING
     coalesce: bool = True                   # False = keep every revision (ablation)
     coalesce_age_s: float = DEFAULT_COALESCE_AGE_S
+    degrade: bool = True                    # False = iteration-1 behaviour (ablation)
+    degrade_rtt_s: float = DEFAULT_DEGRADE_RTT_S
+    degrade_hold_s: float = DEFAULT_DEGRADE_HOLD_S
+    degrade_hold_max_s: float = DEFAULT_DEGRADE_HOLD_MAX_S
+    slow_reader_rtt_s: float = DEFAULT_SLOW_READER_RTT_S
+    degraded_idle_s: float = DEFAULT_DEGRADED_IDLE_S
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +257,16 @@ class ClientConn:
        A burst to a healthy client is not coalesced.
     3. Hard bound: if the buffer exceeds max_pending after compaction, close
        with 1013; the client resumes via HISTORY.
+    4. Degraded mode (finals only). The websockets library (max_queue~16)
+       answers pings until its queue fills, so a slightly-slow reader hides
+       ~8 s of backlog before pings slow down. Once a ping takes >=
+       degrade_rtt_s we switch to finals only, letting that backlog drain.
+       Hold = max(degrade_hold_s, DRAIN_FACTOR * RTT). DRAIN_FACTOR=6:
+       websockets pauses at 16 messages, so a T-second ping implies ~1.8T of
+       actual lag, draining at ~1/3 rate in T3 => ~5.4T to clear.
+       RTT >= slow_reader_rtt_s means the client's queue overflowed; it stays
+       degraded for degrade_hold_max_s. Leave when hold expires and offered
+       rate fits the measured read rate.
     """
 
     def __init__(self, ws: Any, session: SessionState, client_id: Any,
@@ -260,7 +288,28 @@ class ClientConn:
         self.sent = 0
         self.acked = 0
         self._ping_task: asyncio.Task | None = None
+        self._ping_started: float | None = None  # monotonic time of outstanding ping
+        self.last_send = 0.0
+
+        # degraded mode state (see class docstring, point 4)
+        self.degraded = False
+        self.degraded_until = 0.0
+        self.hold_s = cfg.degrade_hold_s
+        self.left_degraded_at: float | None = None
+        self.entered_degraded_at = 0.0
+        self.last_episode_s = 0.0
+        self.read_rate: float | None = None   # msgs/s, measured while saturated
+        self.read_rate_at = 0.0
+        self.offered_rate = 0.0               # msgs/s handed to enqueue()
+        self._rate_count = 0
+        self._rate_t0 = time.monotonic()
         self._sender: asyncio.Task | None = None
+        # time spent blocked on the window, for the read-rate measurement
+        self._gated_total = 0.0
+        self._gated_t = 0.0
+        self._meas_t0 = self._rate_t0
+        self._meas_acked0 = 0
+        self._meas_gated0 = 0.0
 
         # statistics for logs/report
         self.coalesced = 0
@@ -269,6 +318,8 @@ class ClientConn:
         self.gate_events = 0
         self.overflowed = False
         self.rtt_ms: float | None = None
+        self.degrade_events = 0
+        self.degraded_dropped = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -296,6 +347,8 @@ class ClientConn:
         if self.closed or cap.segment <= self.floor_segment:
             return
         now = time.monotonic()
+        self._count_offered(now)
+        self._update_mode(now)
         slots = self.pending.get(cap.segment)
         if slots is None:
             self.pending[cap.segment] = [[cap, now]]
@@ -305,7 +358,7 @@ class ClientConn:
             if cap.revision <= last[0].revision:
                 return
             if (self.cfg.coalesce and not last[0].final
-                    and (self._window_full()
+                    and (self.degraded or self._window_full()
                          or now - last[1] >= self.cfg.coalesce_age_s)):
                 last[0] = cap            # replace in place; keep queue position
                 self.coalesced += 1
@@ -326,6 +379,60 @@ class ClientConn:
 
     def _window_full(self) -> bool:
         return self.cfg.window > 0 and self.sent - self.acked >= self.cfg.window
+
+    def _slow_signal(self, now: float) -> bool:
+        """True if the current ping has been outstanding for too long."""
+        return (self._ping_started is not None
+                and now - self._ping_started >= self.cfg.degrade_rtt_s)
+
+    def _count_offered(self, now: float) -> None:
+        """Rate of updates offered to this client (what normal mode sends)."""
+        self._rate_count += 1
+        elapsed = now - self._rate_t0
+        if elapsed >= RATE_PERIOD_S:
+            sample = self._rate_count / elapsed
+            self.offered_rate = (sample if self.offered_rate == 0.0
+                                 else 0.5 * self.offered_rate + 0.5 * sample)
+            self._rate_count = 0
+            self._rate_t0 = now
+
+    def _too_slow_for_full_rate(self, now: float) -> bool:
+        return (self.read_rate is not None
+                and now - self.read_rate_at < self.cfg.degrade_hold_max_s
+                and self.offered_rate > DEFAULT_DEGRADE_HEADROOM * self.read_rate)
+
+    def _update_mode(self, now: float) -> None:
+        if not self.cfg.degrade:
+            return
+        if self._slow_signal(now):
+            self._note_slow(now, now - self._ping_started)
+        elif (self.degraded and now >= self.degraded_until
+              and not self._too_slow_for_full_rate(now)):
+            self.degraded = False
+            self.left_degraded_at = now
+            self.last_episode_s = now - self.entered_degraded_at
+            log.debug("client %s leaves degraded mode", self.client_id)
+
+    def _note_slow(self, now: float, rtt: float) -> None:
+        """Enter or extend degraded mode. rtt is the slow ping's wait time."""
+        if not self.cfg.degrade:
+            return
+        if not self.degraded:
+            relapsed = (self.left_degraded_at is not None
+                        and now - self.left_degraded_at < self.last_episode_s)
+            self.hold_s = (min(self.hold_s * 2, self.cfg.degrade_hold_max_s)
+                           if relapsed else self.cfg.degrade_hold_s)
+            self.degraded = True
+            self.entered_degraded_at = now
+            self.degrade_events += 1
+            log.debug("client %s enters degraded mode (hold %.0fs)",
+                      self.client_id, self.hold_s)
+            self._compact()
+        if rtt >= self.cfg.slow_reader_rtt_s:
+            hold = self.cfg.degrade_hold_max_s     # persistent slow reader
+        else:
+            hold = max(self.hold_s, DRAIN_FACTOR * rtt)
+        self.degraded_until = max(self.degraded_until, now + hold)
 
     def _compact(self) -> None:
         """Keep only finals and the newest revision of each segment."""
@@ -358,8 +465,22 @@ class ClientConn:
         if self.control:
             return self.control.popleft()
         now = time.monotonic()
+        self._update_mode(now)
         while self.pending:
             seg, slots = next(iter(self.pending.items()))
+            if self.degraded and not slots[0][0].final:
+                if self.npending > 1:
+                    # Something newer is queued behind this provisional (a
+                    # newer revision, a final, or a later segment): drop it.
+                    slots.pop(0)
+                    self.npending -= 1
+                    if not slots:
+                        del self.pending[seg]
+                    self.coalesced += 1
+                    self.degraded_dropped += 1
+                    continue
+                if self.sent > self.acked or now - self.last_send < self.cfg.degraded_idle_s:
+                    return None   # newest provisional waits for an idle client
             cap, enq = slots.pop(0)
             self.npending -= 1
             if not slots:
@@ -383,17 +504,31 @@ class ClientConn:
                 if self._window_full():
                     if not self.gated:
                         self.gated = True
+                        self._gated_t = time.monotonic()
                         self.gate_events += 1
                     self._maybe_ping(force=True)
                     self.wake.clear()
                     await self.wake.wait()
                     continue
-                self.gated = False
+                if self.gated:
+                    self.gated = False
+                    self._gated_total += time.monotonic() - self._gated_t
                 text = self._pop_next()
                 if text is None:
+                    if self.pending:
+                        # Degraded and only a provisional is left: make sure
+                        # a pong will wake us, and re-check after the idle time.
+                        self._maybe_ping(force=True)
+                        self.wake.clear()
+                        try:
+                            await asyncio.wait_for(self.wake.wait(),
+                                                   self.cfg.degraded_idle_s / 4)
+                        except TimeoutError:
+                            pass
                     continue
                 await self.ws.send(text)
                 self.sent += 1
+                self.last_send = time.monotonic()
                 self._maybe_ping()
         except asyncio.CancelledError:
             raise
@@ -407,6 +542,7 @@ class ClientConn:
             return
         unacked = self.sent - self.acked
         if unacked >= self.cfg.ping_after or (force and unacked > 0):
+            self._ping_started = time.monotonic()
             self._ping_task = asyncio.create_task(self._ping(self.sent))
 
     async def _ping(self, marker: int) -> None:
@@ -422,10 +558,30 @@ class ClientConn:
             pass  # connection closing; the handler cleans up
         finally:
             self._ping_task = None
+            self._ping_started = None
         if ok:
-            rtt = (time.monotonic() - started) * 1000.0
+            now = time.monotonic()
+            slow = now - started >= self.cfg.degrade_rtt_s
+            if slow:
+                self._note_slow(now, now - started)
+            rtt = (now - started) * 1000.0
             self.rtt_ms = rtt if self.rtt_ms is None else 0.8 * self.rtt_ms + 0.2 * rtt
             if marker > self.acked:
                 self.acked = marker
+            self._measure_read_rate(now)
             self.wake.set()
             self._maybe_ping()
+
+    def _measure_read_rate(self, now: float) -> None:
+        """Read rate = acks per second over a period the client was the
+        bottleneck (sender blocked on the window most of the time)."""
+        elapsed = now - self._meas_t0
+        if elapsed < READ_RATE_WINDOW_S:
+            return
+        gated = self._gated_total + (now - self._gated_t if self.gated else 0.0)
+        if gated - self._meas_gated0 >= SATURATED_FRACTION * elapsed:
+            sample = (self.acked - self._meas_acked0) / elapsed
+            self.read_rate = (sample if self.read_rate is None
+                              else 0.5 * self.read_rate + 0.5 * sample)
+            self.read_rate_at = now
+        self._meas_t0, self._meas_acked0, self._meas_gated0 = now, self.acked, gated

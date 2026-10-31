@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CS3103 Assignment 4 - LiveRecall server (iteration 1).
+"""CS3103 Assignment 4 - LiveRecall server (iteration 2).
 
 Entry point: python solution_server.py --port 8765
 
 WebSocket glue; graded logic is in liverecall_core.py so it can be
-unit-tested without a network. Experiment flags (--no-coalesce etc.) are for
+unit-tested without a network. Experiment flags (--no-degrade etc.) are for
 the before/after comparison; defaults are the submitted config.
 """
 
@@ -36,7 +36,7 @@ MAX_INCOMING_MESSAGE = 2**20
 CONFIG = ServerConfig()
 SESSIONS: dict[str, SessionState] = {}
 TOTALS = {"clients_served": 0, "coalesced": 0, "overflow_closes": 0,
-          "gate_events": 0, "max_pending_seen": 0}
+          "gate_events": 0, "max_pending_seen": 0, "degrade_events": 0}
 
 
 def get_session(name: str) -> SessionState | None:
@@ -142,6 +142,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         conn.stop()
         TOTALS["coalesced"] += conn.coalesced
         TOTALS["gate_events"] += conn.gate_events
+        TOTALS["degrade_events"] += conn.degrade_events
         TOTALS["max_pending_seen"] = max(TOTALS["max_pending_seen"], conn.max_npending)
         if conn.overflowed:
             TOTALS["overflow_closes"] += 1
@@ -174,12 +175,15 @@ def summary_line() -> str:
     coalesced = TOTALS["coalesced"] + sum(c.coalesced for c in live)
     max_pending = max([TOTALS["max_pending_seen"]] + [c.max_npending for c in live])
     gated_now = sum(c.gated for c in live)
+    degraded_now = sum(c.degraded for c in live)
+    degrade_events = TOTALS["degrade_events"] + sum(c.degrade_events for c in live)
     hist = sum(len(s.history) for s in SESSIONS.values())
     counters = {}
     for s in SESSIONS.values():
         for k, v in s.counters.items():
             counters[k] = counters.get(k, 0) + v
-    return (f"clients={len(live)} gated_now={gated_now} history_items={hist} "
+    return (f"clients={len(live)} gated_now={gated_now} degraded_now={degraded_now} "
+            f"degrade_events={degrade_events} history_items={hist} "
             f"coalesced={coalesced} max_pending={max_pending} "
             f"overflow_closes={TOTALS['overflow_closes']} "
             f"source={counters}")
@@ -189,6 +193,24 @@ async def stats_loop(interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
         log.info("stats %s", summary_line())
+
+
+class _ProbeNoiseFilter(logging.Filter):
+    """Suppress 'opening handshake failed' for the TCP readiness probe.
+
+    run_demo.py probes with a plain TCP connect; websockets logs it as a
+    failed handshake. Only the 0-byte case is dropped; real errors still log.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.getMessage() != "opening handshake failed" or not record.exc_info:
+            return True
+        exc = record.exc_info[1]
+        while exc is not None:
+            if isinstance(exc, EOFError) and "after 0 bytes" in str(exc):
+                return False
+            exc = exc.__cause__
+        return True
 
 
 async def main_async(args) -> None:
@@ -201,8 +223,8 @@ async def main_async(args) -> None:
         ping_timeout=40,
     ):
         log.info("LiveRecall listening on ws://%s:%d (window=%d, coalesce=%s, "
-                 "max_pending=%d, history=%.0fs)", args.host, args.port,
-                 CONFIG.window, CONFIG.coalesce, CONFIG.max_pending,
+                 "degrade=%s, max_pending=%d, history=%.0fs)", args.host, args.port,
+                 CONFIG.window, CONFIG.coalesce, CONFIG.degrade, CONFIG.max_pending,
                  CONFIG.history_retain_s)
         if args.stats_interval > 0:
             asyncio.create_task(stats_loop(args.stats_interval))
@@ -224,6 +246,17 @@ def main() -> None:
     exp.add_argument("--no-coalesce", action="store_true",
                      help="never drop superseded provisional revisions")
     exp.add_argument("--coalesce-age-ms", type=float, default=CONFIG.coalesce_age_s * 1000)
+    exp.add_argument("--no-degrade", action="store_true",
+                     help="disable the finals-only degraded mode (iteration-1 behaviour)")
+    exp.add_argument("--degrade-rtt-ms", type=float, default=CONFIG.degrade_rtt_s * 1000,
+                     help="ping RTT that marks a client as too slow")
+    exp.add_argument("--degrade-hold", type=float, default=CONFIG.degrade_hold_s,
+                     help="seconds to stay degraded after the last slow ping (doubles on relapse)")
+    exp.add_argument("--degrade-hold-max", type=float, default=CONFIG.degrade_hold_max_s)
+    exp.add_argument("--slow-reader-rtt-ms", type=float, default=CONFIG.slow_reader_rtt_s * 1000,
+                     help="ping RTT that marks a persistent slow reader (degraded for --degrade-hold-max)")
+    exp.add_argument("--degraded-idle-ms", type=float, default=CONFIG.degraded_idle_s * 1000,
+                     help="degraded clients get a provisional only after this idle time")
     exp.add_argument("--history-retain", type=float, default=CONFIG.history_retain_s,
                      help="seconds of finalized captions kept for recovery (>= 60)")
     exp.add_argument("--history-max-items", type=int, default=CONFIG.history_max_items)
@@ -239,6 +272,12 @@ def main() -> None:
     CONFIG.max_pending = max(1, args.max_pending)
     CONFIG.coalesce = not args.no_coalesce
     CONFIG.coalesce_age_s = max(0.0, args.coalesce_age_ms / 1000.0)
+    CONFIG.degrade = not args.no_degrade
+    CONFIG.degrade_rtt_s = max(0.0, args.degrade_rtt_ms / 1000.0)
+    CONFIG.degrade_hold_s = max(0.0, args.degrade_hold)
+    CONFIG.degrade_hold_max_s = max(CONFIG.degrade_hold_s, args.degrade_hold_max)
+    CONFIG.slow_reader_rtt_s = max(CONFIG.degrade_rtt_s, args.slow_reader_rtt_ms / 1000.0)
+    CONFIG.degraded_idle_s = max(0.0, args.degraded_idle_ms / 1000.0)
     CONFIG.history_retain_s = args.history_retain
     CONFIG.history_max_items = max(1, args.history_max_items)
 
@@ -248,6 +287,7 @@ def main() -> None:
     )
     # The websockets library is chatty at DEBUG; keep our own logs readable.
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.server").addFilter(_ProbeNoiseFilter())
 
     try:
         asyncio.run(main_async(args))

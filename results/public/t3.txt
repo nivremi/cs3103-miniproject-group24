@@ -1,0 +1,121 @@
+2026-10-27 23:36:42,184 INFO LiveRecall listening on ws://0.0.0.0:8765 (window=8, coalesce=True, degrade=True, max_pending=400, history=90s)
+Starting 100 clients; slow=10, disconnecting=0, late=0
+2026-10-27 23:36:42,370 INFO session L1 created
+2026-10-27 23:36:43,342 INFO source connected: session=L1
+2026-10-27 23:37:40,645 INFO source finished; clients=100 gated_now=0 degraded_now=10 degrade_events=10 net_stalls=0 history_items=76 coalesced=1260 max_pending=6 overflow_closes=0 resyncs=0 source={'accepted': 228, 'stale_or_duplicate': 0, 'after_final': 0, 'expired': 0}
+SOURCE_DONE: emitted 76 finalized segments2026-10-27 23:37:40,645 INFO source disconnected (rejected 0 malformed messages)
+
+Results written to /home/a/Desktop/cs3103/submission/t3_run01.csv
+2026-10-27 23:37:42,827 INFO LiveRecall listening on ws://0.0.0.0:8765 (window=8, coalesce=True, degrade=True, max_pending=400, history=90s)
+Starting 100 clients; slow=10, disconnecting=0, late=0
+2026-10-27 23:37:43,015 INFO session L1 created
+2026-10-27 23:37:43,996 INFO source connected: session=L1
+2026-10-27 23:38:41,303 INFO source finished; clients=100 gated_now=0 degraded_now=10 degrade_events=10 net_stalls=0 history_items=76 coalesced=1260 max_pending=6 overflow_closes=0 resyncs=0 source={'accepted': 228, 'stale_or_duplicate': 0, 'after_final': 0, 'expired': 0}
+SOURCE_DONE: emitted 76 finalized segments
+2026-10-27 23:38:41,307 INFO source disconnected (rejected 0 malformed messages)
+Results written to /home/a/Desktop/cs3103/submission/t3_run02.csv
+2026-10-27 23:38:43,474 INFO LiveRecall listening on ws://0.0.0.0:8765 (window=8, coalesce=True, degrade=True, max_pending=400, history=90s)
+Starting 100 clients; slow=10, disconnecting=0, late=0
+2026-10-27 23:38:43,662 INFO session L1 created
+2026-10-27 23:38:44,652 INFO source connected: session=L1
+SOURCE_DONE: emitted 76 finalized segments
+2026-10-27 23:39:41,945 INFO source finished; clients=100 gated_now=0 degraded_now=10 degrade_events=10 net_stalls=0 history_items=76 coalesced=1260 max_pending=6 overflow_closes=0 resyncs=0 source={'accepted': 228, 'stale_or_duplicate': 0, 'after_final': 0, 'expired': 0}
+2026-10-27 23:39:41,945 INFO source disconnected (rejected 0 malformed messages)
+Results written to /home/a/Desktop/cs3103/submission/t3_run03.csv
+
+=== Run 1/3 ===
+Clients=100, duration=60.0s, source segments=76
+LiveRecall Results
+==================
+Clients observed:              100
+Live caption messages:         21540
+Recovered history items:       0
+Accepted messages:             21540
+Recovered messages:            0
+Duplicate messages observed:   0
+Stale messages observed:       0
+P50 caption age:               5.14 ms
+P95 caption age:               32.72 ms
+P99 caption age:               6859.97 ms
+Fresh Caption Ratio (<=500 ms): 96.61%
+Fresh Final Caption Ratio (<=500 ms): 93.55%
+Successful connections:        100
+Connection errors:             0
+Unique final captions:         7600/7600
+Final-caption completeness:    100.00%
+Unique live revisions:         21540/22800
+Normal Update Coverage:        94.47%
+
+Slow-reader isolation
+---------------------
+Normal clients: P50=5.03 ms, P95=24.51 ms, Fresh=100.00% (20520 msgs)
+Slow clients:   P50=3189.37 ms, P95=8895.62 ms, Fresh=28.43% (1020 msgs)
+
+=== Run 2/3 ===
+Clients=100, duration=60.0s, source segments=76
+LiveRecall Results
+==================
+Clients observed:              100
+Live caption messages:         21540
+Recovered history items:       0
+Accepted messages:             21540
+Recovered messages:            0
+Duplicate messages observed:   0
+Stale messages observed:       0
+P50 caption age:               5.18 ms
+P95 caption age:               32.30 ms
+P99 caption age:               6863.20 ms
+Fresh Caption Ratio (<=500 ms): 96.61%
+Fresh Final Caption Ratio (<=500 ms): 93.55%
+Successful connections:        100
+Connection errors:             0
+Unique final captions:         7600/7600
+Final-caption completeness:    100.00%
+Unique live revisions:         21540/22800
+Normal Update Coverage:        94.47%
+
+Slow-reader isolation
+---------------------
+Normal clients: P50=5.07 ms, P95=25.18 ms, Fresh=100.00% (20520 msgs)
+Slow clients:   P50=3209.83 ms, P95=8884.87 ms, Fresh=28.43% (1020 msgs)
+
+=== Run 3/3 ===
+Clients=100, duration=60.0s, source segments=76
+LiveRecall Results
+==================
+Clients observed:              100
+Live caption messages:         21540
+Recovered history items:       0
+Accepted messages:             21540
+Recovered messages:            0
+Duplicate messages observed:   0
+Stale messages observed:       0
+P50 caption age:               4.55 ms
+P95 caption age:               26.70 ms
+P99 caption age:               6837.94 ms
+Fresh Caption Ratio (<=500 ms): 96.61%
+Fresh Final Caption Ratio (<=500 ms): 93.55%
+Successful connections:        100
+Connection errors:             0
+Unique final captions:         7600/7600
+Final-caption completeness:    100.00%
+Unique live revisions:         21540/22800
+Normal Update Coverage:        94.47%
+
+Slow-reader isolation
+---------------------
+Normal clients: P50=4.45 ms, P95=14.54 ms, Fresh=100.00% (20520 msgs)
+Slow clients:   P50=3175.48 ms, P95=8864.90 ms, Fresh=28.43% (1020 msgs)
+
+=== Median across independent runs ===
+P50 caption age                     5.14 ms
+P95 caption age                    32.30 ms
+P99 caption age                  6859.97 ms
+Fresh Caption Ratio                96.61 %
+Fresh Final Caption Ratio          93.55 %
+Final completeness                100.00 %
+Normal Update Coverage             94.47 %
+Normal-client P95                  24.51 ms
+Slow-client P95                  8884.87 ms
+
+Public run complete. CSV and JSON result files were written beside run_demo.py.

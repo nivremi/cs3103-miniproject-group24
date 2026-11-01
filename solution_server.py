@@ -36,7 +36,8 @@ MAX_INCOMING_MESSAGE = 2**20
 CONFIG = ServerConfig()
 SESSIONS: dict[str, SessionState] = {}
 TOTALS = {"clients_served": 0, "coalesced": 0, "overflow_closes": 0,
-          "gate_events": 0, "max_pending_seen": 0, "degrade_events": 0}
+          "gate_events": 0, "max_pending_seen": 0, "degrade_events": 0,
+          "resyncs": 0}
 
 
 def get_session(name: str) -> SessionState | None:
@@ -143,6 +144,7 @@ async def handle_client(ws, hello: dict[str, Any]) -> None:
         TOTALS["coalesced"] += conn.coalesced
         TOTALS["gate_events"] += conn.gate_events
         TOTALS["degrade_events"] += conn.degrade_events
+        TOTALS["resyncs"] += conn.resynced
         TOTALS["max_pending_seen"] = max(TOTALS["max_pending_seen"], conn.max_npending)
         if conn.overflowed:
             TOTALS["overflow_closes"] += 1
@@ -185,7 +187,7 @@ def summary_line() -> str:
     return (f"clients={len(live)} gated_now={gated_now} degraded_now={degraded_now} "
             f"degrade_events={degrade_events} history_items={hist} "
             f"coalesced={coalesced} max_pending={max_pending} "
-            f"overflow_closes={TOTALS['overflow_closes']} "
+            f"overflow_closes={TOTALS['overflow_closes']} resyncs={TOTALS['resyncs']} "
             f"source={counters}")
 
 
@@ -257,6 +259,10 @@ def main() -> None:
                      help="ping RTT that marks a persistent slow reader (degraded for --degrade-hold-max)")
     exp.add_argument("--degraded-idle-ms", type=float, default=CONFIG.degraded_idle_s * 1000,
                      help="degraded clients get a provisional only after this idle time")
+    exp.add_argument("--no-resync", action="store_true",
+                     help="never close a client that cannot keep up with finals")
+    exp.add_argument("--resync-lag", type=float, default=CONFIG.resync_lag_s,
+                     help="estimated client lag (s) that triggers a 1013 resume")
     exp.add_argument("--history-retain", type=float, default=CONFIG.history_retain_s,
                      help="seconds of finalized captions kept for recovery (>= 60)")
     exp.add_argument("--history-max-items", type=int, default=CONFIG.history_max_items)
@@ -278,6 +284,8 @@ def main() -> None:
     CONFIG.degrade_hold_max_s = max(CONFIG.degrade_hold_s, args.degrade_hold_max)
     CONFIG.slow_reader_rtt_s = max(CONFIG.degrade_rtt_s, args.slow_reader_rtt_ms / 1000.0)
     CONFIG.degraded_idle_s = max(0.0, args.degraded_idle_ms / 1000.0)
+    CONFIG.resync = not args.no_resync
+    CONFIG.resync_lag_s = max(1.0, args.resync_lag)
     CONFIG.history_retain_s = args.history_retain
     CONFIG.history_max_items = max(1, args.history_max_items)
 

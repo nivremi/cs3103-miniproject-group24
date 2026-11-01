@@ -326,6 +326,54 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         conn._note_slow(t + 200.0, rtt=cfg.slow_reader_rtt_s)   # queue overflowed
         self.assertEqual(conn.degraded_until, t + 200.0 + cfg.degrade_hold_max_s)
 
+    def _degraded_conn(self, read_rate, final_rate, lag_s, client_id="c1"):
+        cfg = core.ServerConfig()
+        state = core.SessionState("L1", cfg)
+        state.final_rate = final_rate
+        ws = FakeClientWS()
+        conn = core.ClientConn(ws, state, client_id, 0, cfg)
+        now = time.monotonic()
+        conn._note_slow(now, rtt=cfg.slow_reader_rtt_s)
+        conn.read_rate = read_rate
+        conn._bucket, conn._bucket_t = lag_s * read_rate, now   # lag_s queued
+        return cfg, state, ws, conn
+
+    async def test_resync_when_client_cannot_keep_up_with_finals(self):
+        """Reads 1 msg/s, finals arrive at 1.33/s: only a HISTORY reply can
+        catch it up, so it is closed with 1013 and remembered as slow."""
+        cfg, state, ws, conn = self._degraded_conn(1.0, 1.33, 7.0)  # > resync_lag_s
+        conn.enqueue(cap(1, 1, final=True))
+        await asyncio.sleep(0.01)
+        self.assertTrue(conn.resynced)
+        self.assertEqual(ws.close_code, core.CLOSE_TOO_SLOW)
+        self.assertEqual(conn.npending, 0)
+        # The resumed connection starts degraded with the known read rate.
+        again = core.ClientConn(FakeClientWS(), state, "c1", 1, cfg)
+        self.assertTrue(again.degraded)
+        self.assertEqual(again.read_rate, 1.0)
+        other = core.ClientConn(FakeClientWS(), state, "c2", 1, cfg)
+        self.assertFalse(other.degraded)
+
+    async def test_no_resync_when_finals_fit_or_lag_small(self):
+        for read_rate, lag in ((2.0, 7.0),     # T3: finals-only will drain it
+                               (1.0, 2.0)):    # too slow, but not behind yet
+            cfg, state, ws, conn = self._degraded_conn(read_rate, 1.33, lag)
+            conn.enqueue(cap(1, 1, final=True))
+            await asyncio.sleep(0.01)
+            self.assertFalse(conn.resynced, (read_rate, lag))
+            self.assertIsNone(ws.close_code)
+            conn.stop()
+
+    def test_slow_reader_memory_is_bounded_and_expires(self):
+        state = core.SessionState("L1", core.ServerConfig(degrade_hold_max_s=10))
+        for i in range(core.SLOW_READER_MEMORY + 50):
+            state.remember_slow(i, 1.0, now=0.0)
+        self.assertEqual(len(state.slow_readers), core.SLOW_READER_MEMORY)
+        self.assertIsNone(state.known_slow_rate(0, now=1.0))      # evicted (LRU)
+        self.assertEqual(state.known_slow_rate(100, now=1.0), 1.0)
+        self.assertIsNone(state.known_slow_rate(100, now=11.0))   # expired
+        state.remember_slow({"not": "hashable"}, 1.0, now=0.0)    # ignored
+
     async def test_overflow_closes_with_1013(self):
         cfg = core.ServerConfig(max_pending=20)
         state = core.SessionState("L1", cfg)

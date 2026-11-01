@@ -51,6 +51,10 @@ RATE_PERIOD_S = 2.0                # offered-rate measurement period
 READ_RATE_WINDOW_S = 10.0          # read-rate measurement period
 SATURATED_FRACTION = 0.8           # ...counted only if blocked on the window this often
 
+# Slow-consumer resync (iteration 2). See ClientConn point 5.
+DEFAULT_RESYNC_LAG_S = 6.0         # estimated lag that triggers a resync
+SLOW_READER_MEMORY = 4096          # bounded record of known slow client_ids
+
 # WebSocket close code 1013 = "try again later": client reconnects and
 # resumes with its last finalized state (§4.2).
 CLOSE_TOO_SLOW = 1013
@@ -71,6 +75,8 @@ class ServerConfig:
     degrade_hold_max_s: float = DEFAULT_DEGRADE_HOLD_MAX_S
     slow_reader_rtt_s: float = DEFAULT_SLOW_READER_RTT_S
     degraded_idle_s: float = DEFAULT_DEGRADED_IDLE_S
+    resync: bool = True                     # False = never force a resume
+    resync_lag_s: float = DEFAULT_RESYNC_LAG_S
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +171,12 @@ class SessionState:
         self.clients: set[ClientConn] = set()
         self.counters = {"accepted": 0, "stale_or_duplicate": 0,
                          "after_final": 0, "expired": 0}
+        # Finals per second (EWMA over source_ts gaps); used by resync.
+        self.final_rate = 0.0
+        self._last_final_ts: float | None = None
+        # client_id -> (read_rate msgs/s, expires_at): clients we had to
+        # resync, so their next connection starts degraded (bounded, LRU).
+        self.slow_readers: OrderedDict[Any, tuple[float, float]] = OrderedDict()
 
     # -- source side -------------------------------------------------------
 
@@ -205,6 +217,7 @@ class SessionState:
         h = self.history
         if not h or cap.segment > h[-1].segment:
             h.append(cap)
+            self._update_final_rate(cap.source_ts)
         else:  # out-of-order final (not produced by the public source)
             i = len(h)
             while i > 0 and h[i - 1].segment > cap.segment:
@@ -212,6 +225,33 @@ class SessionState:
             h.insert(i, cap)
         self.final_segments.add(cap.segment)
         self._trim()
+
+    def _update_final_rate(self, ts: float) -> None:
+        last, self._last_final_ts = self._last_final_ts, ts
+        if last is None or not 0 < ts - last < 60:
+            return
+        sample = 1.0 / (ts - last)
+        self.final_rate = (sample if self.final_rate == 0.0
+                           else 0.8 * self.final_rate + 0.2 * sample)
+
+    def remember_slow(self, client_id: Any, read_rate: float, now: float) -> None:
+        if not isinstance(client_id, (str, int)):
+            return
+        self.slow_readers.pop(client_id, None)
+        self.slow_readers[client_id] = (read_rate, now + self.cfg.degrade_hold_max_s)
+        while len(self.slow_readers) > SLOW_READER_MEMORY:
+            self.slow_readers.popitem(last=False)
+
+    def known_slow_rate(self, client_id: Any, now: float) -> float | None:
+        if not isinstance(client_id, (str, int)):
+            return None
+        entry = self.slow_readers.get(client_id)
+        if entry is None:
+            return None
+        if entry[1] <= now:
+            del self.slow_readers[client_id]
+            return None
+        return entry[0]
 
     def _trim(self) -> None:
         h = self.history
@@ -267,6 +307,10 @@ class ClientConn:
        RTT >= slow_reader_rtt_s means the client's queue overflowed; it stays
        degraded for degrade_hold_max_s. Leave when hold expires and offered
        rate fits the measured read rate.
+    5. Slow-consumer resync: if read rate < finals rate, close with 1013 when
+       estimated lag >= resync_lag_s. CLIENT_HELLO -> HISTORY handles
+       recovery. client_id is remembered so the next connection starts
+       degraded.
     """
 
     def __init__(self, ws: Any, session: SessionState, client_id: Any,
@@ -298,6 +342,7 @@ class ClientConn:
         self.left_degraded_at: float | None = None
         self.entered_degraded_at = 0.0
         self.last_episode_s = 0.0
+        self._last_slow_rtt = 0.0
         self.read_rate: float | None = None   # msgs/s, measured while saturated
         self.read_rate_at = 0.0
         self.offered_rate = 0.0               # msgs/s handed to enqueue()
@@ -311,6 +356,19 @@ class ClientConn:
         self._meas_acked0 = 0
         self._meas_gated0 = 0.0
 
+        # resync state (see class docstring, point 5)
+        self._bucket = 0.0        # estimated messages queued at the client
+        self._bucket_t = time.monotonic()
+        self.resynced = False
+        known = session.known_slow_rate(client_id, self._bucket_t) if cfg.resync else None
+        if known is not None and cfg.degrade:
+            # Resumed after a resync: start degraded with the known read rate.
+            self.read_rate = known
+            self.read_rate_at = self._bucket_t
+            self.degraded = True
+            self.entered_degraded_at = self._bucket_t
+            self.degraded_until = self._bucket_t + cfg.degrade_hold_max_s
+
         # statistics for logs/report
         self.coalesced = 0
         self.max_npending = 0
@@ -320,6 +378,7 @@ class ClientConn:
         self.rtt_ms: float | None = None
         self.degrade_events = 0
         self.degraded_dropped = 0
+        self.started_degraded = self.degraded
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -349,6 +408,8 @@ class ClientConn:
         now = time.monotonic()
         self._count_offered(now)
         self._update_mode(now)
+        if self.closed:          # _update_mode may have resynced the client
+            return
         slots = self.pending.get(cap.segment)
         if slots is None:
             self.pending[cap.segment] = [[cap, now]]
@@ -404,6 +465,9 @@ class ClientConn:
     def _update_mode(self, now: float) -> None:
         if not self.cfg.degrade:
             return
+        if self._should_resync(now):
+            self._resync(now)
+            return
         if self._slow_signal(now):
             self._note_slow(now, now - self._ping_started)
         elif (self.degraded and now >= self.degraded_until
@@ -412,6 +476,33 @@ class ClientConn:
             self.left_degraded_at = now
             self.last_episode_s = now - self.entered_degraded_at
             log.debug("client %s leaves degraded mode", self.client_id)
+
+    def _estimated_lag(self, now: float) -> float:
+        """Seconds of messages the client still has to read (leaky bucket)."""
+        if not self.read_rate:
+            return 0.0
+        queued = max(0.0, self._bucket - self.read_rate * (now - self._bucket_t))
+        return queued / self.read_rate
+
+    def _bucket_add(self, now: float) -> None:
+        if self.read_rate:
+            self._bucket = self._estimated_lag(now) * self.read_rate + 1
+        self._bucket_t = now
+
+    def _should_resync(self, now: float) -> bool:
+        return (self.cfg.resync and self.degraded and self.read_rate is not None
+                and self.session.final_rate > self.read_rate
+                and self._estimated_lag(now) >= self.cfg.resync_lag_s)
+
+    def _resync(self, now: float) -> None:
+        log.info("client %s cannot keep up with finals (reads %.2f/s, finals %.2f/s, "
+                 "lag ~%.1fs); closing with %d to resume via HISTORY", self.client_id,
+                 self.read_rate, self.session.final_rate, self._estimated_lag(now),
+                 CLOSE_TOO_SLOW)
+        self.resynced = True
+        self.session.remember_slow(self.client_id, self.read_rate, now)
+        self.stop()
+        asyncio.ensure_future(self._close_quietly(CLOSE_TOO_SLOW, "too slow; resume"))
 
     def _note_slow(self, now: float, rtt: float) -> None:
         """Enter or extend degraded mode. rtt is the slow ping's wait time."""
@@ -466,6 +557,8 @@ class ClientConn:
             return self.control.popleft()
         now = time.monotonic()
         self._update_mode(now)
+        if self.closed:
+            return None
         while self.pending:
             seg, slots = next(iter(self.pending.items()))
             if self.degraded and not slots[0][0].final:
@@ -529,6 +622,7 @@ class ClientConn:
                 await self.ws.send(text)
                 self.sent += 1
                 self.last_send = time.monotonic()
+                self._bucket_add(self.last_send)
                 self._maybe_ping()
         except asyncio.CancelledError:
             raise
@@ -563,6 +657,7 @@ class ClientConn:
             now = time.monotonic()
             slow = now - started >= self.cfg.degrade_rtt_s
             if slow:
+                self._last_slow_rtt = now - started
                 self._note_slow(now, now - started)
             rtt = (now - started) * 1000.0
             self.rtt_ms = rtt if self.rtt_ms is None else 0.8 * self.rtt_ms + 0.2 * rtt
@@ -581,7 +676,11 @@ class ClientConn:
         gated = self._gated_total + (now - self._gated_t if self.gated else 0.0)
         if gated - self._meas_gated0 >= SATURATED_FRACTION * elapsed:
             sample = (self.acked - self._meas_acked0) / elapsed
-            self.read_rate = (sample if self.read_rate is None
-                              else 0.5 * self.read_rate + 0.5 * sample)
+            first = self.read_rate is None
+            self.read_rate = sample if first else 0.5 * self.read_rate + 0.5 * sample
             self.read_rate_at = now
+            if first:
+                # The client is at least as far behind as its last slow ping.
+                self._bucket = self._last_slow_rtt * self.read_rate
+                self._bucket_t = now
         self._meas_t0, self._meas_acked0, self._meas_gated0 = now, self.acked, gated

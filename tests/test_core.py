@@ -360,6 +360,26 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         conn = await self._stalled_ping_run(net_busy=lambda: True, net_check=False)
         self.assertGreaterEqual(conn.degrade_events, 1)
 
+    def test_network_limited_episode_recovers_quickly(self):
+        """Point 6: after a bandwidth bottleneck (most slow-ping checks saw
+        unACKed bytes) the 120 s slow-reader rules don't apply."""
+        cfg = core.ServerConfig()
+        state = core.SessionState("L1", cfg)
+        conn = core.ClientConn(FakeClientWS(), state, 1, 0, cfg)
+        t = 100.0
+        conn._net_checks, conn._reader_checks = 5, 1
+        conn.read_rate, conn.read_rate_at = 1.0, t   # rate measured on the slow link
+        conn.offered_rate = 4.0
+        conn._note_slow(t, rtt=cfg.slow_reader_rtt_s + 1)
+        self.assertEqual(conn.degraded_until, t + core.NET_HOLD_S)
+        conn._update_mode(t + core.NET_HOLD_S)
+        self.assertFalse(conn.degraded)
+        self.assertEqual((conn._net_checks, conn._reader_checks), (0, 0))
+        # Same signals with the reader to blame: the slow-reader rules hold.
+        conn._reader_checks = 5
+        conn._note_slow(t + 10, rtt=cfg.slow_reader_rtt_s + 1)
+        self.assertEqual(conn.degraded_until, t + 10 + cfg.degrade_hold_max_s)
+
     def _degraded_conn(self, read_rate, final_rate, lag_s, client_id="c1"):
         cfg = core.ServerConfig()
         state = core.SessionState("L1", cfg)

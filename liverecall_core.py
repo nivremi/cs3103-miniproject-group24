@@ -47,6 +47,7 @@ DEFAULT_SLOW_READER_RTT_S = 3.0    # ping this slow = the client's own queue ove
 DEFAULT_DEGRADED_IDLE_S = 1.0      # degraded: provisional only after this idle time
 DEFAULT_DEGRADE_HEADROOM = 0.8     # leave only if full rate <= 80% of read rate
 DRAIN_FACTOR = 6.0                 # hold >= 6 x slow RTT (time to drain the backlog)
+NET_HOLD_S = 5.0                   # hold when the network, not the reader, was slow
 RATE_PERIOD_S = 2.0                # offered-rate measurement period
 READ_RATE_WINDOW_S = 10.0          # read-rate measurement period
 SATURATED_FRACTION = 0.8           # ...counted only if blocked on the window this often
@@ -323,6 +324,13 @@ class ClientConn:
        arrives the retransmission has been ACKed). A ping the network was
        holding is not a slow signal; window-full coalescing (point 2) still
        keeps a congested link to the newest revision of each segment.
+       Some slow pings still get through on a congested link (e.g. the pong
+       queued behind other traffic), so a degraded episode is also
+       classified: if most slow-ping checks since the last leave found the
+       network busy, it is network-limited. Then the hold is NET_HOLD_S
+       and the slow-reader rules (120 s hold, read-rate gate) don't apply,
+       so the client returns to full updates within seconds of the network
+       recovering (§10). Measured with stress_tests/bw_recovery.sh.
     """
 
     def __init__(self, ws: Any, session: SessionState, client_id: Any,
@@ -394,6 +402,8 @@ class ClientConn:
         self.degraded_dropped = 0
         self.net_stalls = 0       # slow-ping checks blamed on the network (point 6)
         self._ping_net_stalled: bool | None = None  # verdict for the outstanding ping
+        self._net_checks = 0      # slow-ping checks since last leave: network busy
+        self._reader_checks = 0   # ... and everything ACKed (reader slow)
         self.started_degraded = self.degraded
 
     # -- lifecycle ---------------------------------------------------------
@@ -481,8 +491,13 @@ class ClientConn:
             self._rate_count = 0
             self._rate_t0 = now
 
+    def _network_limited(self) -> bool:
+        """Current episode was mostly caused by the network (point 6)."""
+        return self._net_checks > self._reader_checks
+
     def _too_slow_for_full_rate(self, now: float) -> bool:
-        return (self.read_rate is not None
+        return (not self._network_limited()
+                and self.read_rate is not None
                 and now - self.read_rate_at < self.cfg.degrade_hold_max_s
                 and self.offered_rate > DEFAULT_DEGRADE_HEADROOM * self.read_rate)
 
@@ -499,6 +514,7 @@ class ClientConn:
             self.degraded = False
             self.left_degraded_at = now
             self.last_episode_s = now - self.entered_degraded_at
+            self._net_checks = self._reader_checks = 0
             log.debug("client %s leaves degraded mode", self.client_id)
 
     def _estimated_lag(self, now: float) -> float:
@@ -543,7 +559,9 @@ class ClientConn:
             log.debug("client %s enters degraded mode (hold %.0fs)",
                       self.client_id, self.hold_s)
             self._compact()
-        if rtt >= self.cfg.slow_reader_rtt_s:
+        if self._network_limited():
+            hold = NET_HOLD_S                      # leave soon after the link recovers
+        elif rtt >= self.cfg.slow_reader_rtt_s:
             hold = self.cfg.degrade_hold_max_s     # persistent slow reader
         else:
             hold = max(self.hold_s, DRAIN_FACTOR * rtt)
@@ -678,6 +696,10 @@ class ClientConn:
                     break
                 except TimeoutError:
                     self._ping_net_stalled = self._network_stalled()
+                    if self._ping_net_stalled:
+                        self._net_checks += 1
+                    else:
+                        self._reader_checks += 1
             ok = True
         except asyncio.CancelledError:
             raise

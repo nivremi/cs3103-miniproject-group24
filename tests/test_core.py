@@ -326,6 +326,40 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         conn._note_slow(t + 200.0, rtt=cfg.slow_reader_rtt_s)   # queue overflowed
         self.assertEqual(conn.degraded_until, t + 200.0 + cfg.degrade_hold_max_s)
 
+    async def _stalled_ping_run(self, net_busy, net_check=True):
+        """Instant reader whose pings take 0.35 s (as when TCP retransmits)."""
+        class StalledPingWS(FakeClientWS):
+            async def ping(self):
+                fut = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_later(0.35, fut.set_result, None)
+                return fut
+        cfg = core.ServerConfig(degrade_rtt_s=0.1, ping_after=1, net_check=net_check)
+        state = core.SessionState("L1", cfg)
+        conn = core.ClientConn(StalledPingWS(), state, 1, 0, cfg, net_busy=net_busy)
+        conn.start()
+        for rev in (1, 2, 3):
+            c = cap(1, rev, final=rev == 3)
+            state.apply(c)
+            conn.enqueue(c)
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(0.4)
+        conn.stop()
+        return conn
+
+    async def test_loss_stall_is_not_a_slow_reader(self):
+        """Point 6: a ping held by TCP loss recovery (our bytes unACKed)
+        must not put a healthy client into finals-only mode."""
+        conn = await self._stalled_ping_run(net_busy=lambda: True)
+        self.assertEqual(conn.degrade_events, 0)
+        self.assertGreater(conn.net_stalls, 0)
+
+    async def test_slow_ping_with_everything_acked_degrades(self):
+        conn = await self._stalled_ping_run(net_busy=lambda: False)
+        self.assertGreaterEqual(conn.degrade_events, 1)
+        # --no-net-check ablation: the probe is ignored.
+        conn = await self._stalled_ping_run(net_busy=lambda: True, net_check=False)
+        self.assertGreaterEqual(conn.degrade_events, 1)
+
     def _degraded_conn(self, read_rate, final_rate, lag_s, client_id="c1"):
         cfg = core.ServerConfig()
         state = core.SessionState("L1", cfg)

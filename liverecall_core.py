@@ -13,7 +13,7 @@ import math
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 log = logging.getLogger("liverecall")
 
@@ -77,6 +77,7 @@ class ServerConfig:
     degraded_idle_s: float = DEFAULT_DEGRADED_IDLE_S
     resync: bool = True                     # False = never force a resume
     resync_lag_s: float = DEFAULT_RESYNC_LAG_S
+    net_check: bool = True                  # False = any slow ping degrades (ablation)
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,11 +312,24 @@ class ClientConn:
        estimated lag >= resync_lag_s. CLIENT_HELLO -> HISTORY handles
        recovery. client_id is remembered so the next connection starts
        degraded.
+    6. Network stall vs slow reader (iteration 3). Under packet loss a TCP
+       retransmission (RTO >= 200 ms, doubling on repeat loss) can hold a
+       ping for over a second although the client reads instantly. In T5
+       that put ~1 in 3 healthy clients into finals-only mode (coverage
+       94%). ``net_busy()`` (from the server: our bytes not yet ACKed by the
+       client's kernel) tells them apart: a slow reader's kernel has ACKed
+       everything and only the app hasn't read it. It is checked while the
+       ping is outstanding, every degrade_rtt_s (by the time the pong
+       arrives the retransmission has been ACKed). A ping the network was
+       holding is not a slow signal; window-full coalescing (point 2) still
+       keeps a congested link to the newest revision of each segment.
     """
 
     def __init__(self, ws: Any, session: SessionState, client_id: Any,
-                 last_segment: int, cfg: ServerConfig):
+                 last_segment: int, cfg: ServerConfig,
+                 net_busy: Callable[[], bool] | None = None):
         self.ws = ws
+        self.net_busy = net_busy if cfg.net_check else None
         self.session = session
         self.client_id = client_id
         self.cfg = cfg
@@ -378,6 +392,8 @@ class ClientConn:
         self.rtt_ms: float | None = None
         self.degrade_events = 0
         self.degraded_dropped = 0
+        self.net_stalls = 0       # slow-ping checks blamed on the network (point 6)
+        self._ping_net_stalled: bool | None = None  # verdict for the outstanding ping
         self.started_degraded = self.degraded
 
     # -- lifecycle ---------------------------------------------------------
@@ -444,7 +460,15 @@ class ClientConn:
     def _slow_signal(self, now: float) -> bool:
         """True if the current ping has been outstanding for too long."""
         return (self._ping_started is not None
-                and now - self._ping_started >= self.cfg.degrade_rtt_s)
+                and now - self._ping_started >= self.cfg.degrade_rtt_s
+                and self._ping_net_stalled is False)
+
+    def _network_stalled(self) -> bool:
+        """Slow ping caused by TCP loss recovery, not the reader (point 6)."""
+        if self.net_busy is None or not self.net_busy():
+            return False
+        self.net_stalls += 1
+        return True
 
     def _count_offered(self, now: float) -> None:
         """Rate of updates offered to this client (what normal mode sends)."""
@@ -637,6 +661,7 @@ class ClientConn:
         unacked = self.sent - self.acked
         if unacked >= self.cfg.ping_after or (force and unacked > 0):
             self._ping_started = time.monotonic()
+            self._ping_net_stalled = None
             self._ping_task = asyncio.create_task(self._ping(self.sent))
 
     async def _ping(self, marker: int) -> None:
@@ -644,7 +669,15 @@ class ClientConn:
         ok = False
         try:
             waiter = await self.ws.ping()
-            await waiter
+            # Every degrade_rtt_s the ping is still out, decide whether the
+            # network or the reader is holding it (point 6).
+            check_s = max(self.cfg.degrade_rtt_s, 0.05)
+            while True:
+                try:
+                    await asyncio.wait_for(asyncio.shield(waiter), check_s)
+                    break
+                except TimeoutError:
+                    self._ping_net_stalled = self._network_stalled()
             ok = True
         except asyncio.CancelledError:
             raise
@@ -655,7 +688,8 @@ class ClientConn:
             self._ping_started = None
         if ok:
             now = time.monotonic()
-            slow = now - started >= self.cfg.degrade_rtt_s
+            slow = (now - started >= self.cfg.degrade_rtt_s
+                    and not self._ping_net_stalled)
             if slow:
                 self._last_slow_rtt = now - started
                 self._note_slow(now, now - started)
